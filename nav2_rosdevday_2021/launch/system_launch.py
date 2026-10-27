@@ -14,13 +14,14 @@
 
 import os
 
+import xacro
 from ament_index_python.packages import get_package_share_directory
 
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
-from launch.conditions import IfCondition
+from launch import LaunchContext, LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -33,6 +34,8 @@ def generate_launch_description():
 
     nav2_launch_dir = os.path.join(nav2_bringup_dir, 'launch')
     launch_dir = os.path.join(bringup_dir, 'launch')
+    warehouse_launch_file = os.path.join(
+        warehouse_dir, 'launch', 'small_warehouse.launch.py')
     rviz_config_file = os.path.join(nav2_bringup_dir, 'rviz', 'nav2_default_view.rviz')
 
     # Create the launch configuration variables
@@ -46,7 +49,9 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration('use_rviz')
     headless = LaunchConfiguration('headless')
     world = LaunchConfiguration('world')
-    urdf = LaunchConfiguration('urdf')
+    my_robot = LaunchConfiguration('my_robot')
+    arm_type = LaunchConfiguration('arm_type')
+    use_docking_adapter = LaunchConfiguration('use_docking_adapter')
 
     # Declare the launch arguments
     declare_slam_cmd = DeclareLaunchArgument(
@@ -91,42 +96,28 @@ def generate_launch_description():
             bringup_dir, 'worlds', 'industrial_sim.world'),
         description='Full path to world model file to load')
 
-    declare_urdf_cmd = DeclareLaunchArgument(
-        'urdf',
-        default_value=os.path.join(
-            robot_model_dir, 'robots', 'mp_400', 'mp_400.urdf'),
-        description='Full path to world model file to load')
+    declare_my_robot_cmd = DeclareLaunchArgument(
+        'my_robot',
+        default_value='mpo_700',
+        description='Robot types: "mpo_700", "mpo_500", "mp_400", "mp_500"')
 
-    # Specify the actions
-    start_gazebo_server_cmd = ExecuteProcess(
-        condition=IfCondition(use_simulator),
-        cmd=['gzserver', '-s', 'libgazebo_ros_factory.so', world],
-        cwd=[warehouse_dir], output='screen')
+    declare_arm_type_cmd = DeclareLaunchArgument(
+        'arm_type',
+        default_value='',
+        description='Arm type (mpo_700/mpo_500 only): ec66, cs66, ur5, ur10, ur5e, ur10e')
 
-    start_gazebo_client_cmd = ExecuteProcess(
-        condition=IfCondition(PythonExpression(
-            [use_simulator, ' and not ', headless])),
-        cmd=['gzclient'],
-        cwd=[warehouse_dir], output='screen')
+    declare_docking_adapter_cmd = DeclareLaunchArgument(
+        'use_docking_adapter',
+        default_value='False',
+        description='Enable the docking adapter (mpo_700 only)')
 
-    spawn_entity_cmd = Node(
-        package='gazebo_ros',
-        executable='spawn_entity.py',
-        arguments=['-entity', 'robot',
-                   '-file', urdf,
-                   '-x', '3.45',
-                   '-y', '2.15',
-                   '-z', '0.10',
-                   '-Y', '3.14'],
-        output='screen')
-
-    start_robot_state_publisher_cmd = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
-        arguments=[urdf])
+    # Let the warehouse package start and configure Gazebo.
+    warehouse_gazebo_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(warehouse_launch_file),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'headless': headless,
+        }.items())
 
     rviz_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -185,11 +176,13 @@ def generate_launch_description():
     ld.add_action(declare_use_rviz_cmd)
     ld.add_action(declare_simulator_cmd)
     ld.add_action(declare_world_cmd)
-    ld.add_action(declare_urdf_cmd)
-    ld.add_action(start_gazebo_server_cmd)
-    ld.add_action(start_gazebo_client_cmd)
-    ld.add_action(spawn_entity_cmd)
-    ld.add_action(start_robot_state_publisher_cmd)
+    ld.add_action(declare_my_robot_cmd)
+    ld.add_action(declare_arm_type_cmd)
+    ld.add_action(declare_docking_adapter_cmd)
+    ld.add_action(warehouse_gazebo_cmd)
+    ld.add_action(OpaqueFunction(
+        function=launch_robot_setup,
+        args=[my_robot, arm_type, use_docking_adapter, use_sim_time, robot_model_dir]))
     ld.add_action(rviz_cmd)
     ld.add_action(bringup_cmd)
     # UNCOMMENT HERE FOR KEEPOUT DEMO
@@ -198,3 +191,59 @@ def generate_launch_description():
     # ld.add_action(start_costmap_filter_info_server_cmd)
 
     return ld
+
+
+def launch_robot_setup(
+        context: LaunchContext, my_robot_arg, arm_type_arg,
+        docking_adapter_arg, use_sim_time_arg, robot_model_dir):
+    """Expand the selected Neo Xacro and spawn that exact description in Gazebo."""
+    robot_name = my_robot_arg.perform(context)
+    arm_type = arm_type_arg.perform(context)
+    use_docking_adapter = docking_adapter_arg.perform(context)
+    use_sim_time = use_sim_time_arg.perform(context).lower() in ('true', '1')
+
+    valid_robots = ('mpo_700', 'mpo_500', 'mp_400', 'mp_500')
+    if robot_name not in valid_robots:
+        raise RuntimeError(
+            "Invalid my_robot={!r}; expected one of {}".format(
+                robot_name, ', '.join(valid_robots)))
+
+    if arm_type and robot_name not in ('mpo_700', 'mpo_500'):
+        raise RuntimeError(
+            '{} does not support arm_type={!r}'.format(robot_name, arm_type))
+
+    # The adapter belongs only to MPO 700, matching neo_simulation2's launcher.
+    if robot_name != 'mpo_700':
+        use_docking_adapter = 'false'
+
+    xacro_file = os.path.join(
+        robot_model_dir, 'robots', robot_name, robot_name + '.urdf.xacro')
+    robot_description = xacro.process_file(
+        xacro_file,
+        mappings={
+            'use_gazebo': 'true',
+            'arm_type': arm_type,
+            'use_docking_adapter': use_docking_adapter,
+        }).toxml()
+
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'robot_description': robot_description,
+        }])
+
+    spawn_entity = Node(
+        package='gazebo_ros',
+        executable='spawn_entity.py',
+        arguments=[
+            '-entity', robot_name,
+            '-topic', '/robot_description',
+            '-x', '3.45', '-y', '2.15', '-z', '0.10', '-Y', '3.14',
+        ],
+        output='screen')
+
+    return [robot_state_publisher, spawn_entity]
